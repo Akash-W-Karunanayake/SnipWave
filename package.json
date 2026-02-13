@@ -1,7 +1,7 @@
 {
-  "name": "voices-audio-cutter",
+  "name": "snipwave",
   "version": "1.0.0",
-  "description": "Multi-cut audio files and zip the pieces",
+  "description": "SnipWave — Split, snip, and zip audio files",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
@@ -9,7 +9,7 @@
   },
   "build": {
     "appId": "com.voices.audiocutter",
-    "productName": "VOICES Audio Cutter",
+    "productName": "SnipWave",
     "win": {
       "target": "nsis",
       "icon": "src/icons/icon.png"
