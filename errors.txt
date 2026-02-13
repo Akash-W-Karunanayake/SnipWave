@@ -1,0 +1,6 @@
+Error occurred in handler for 'split-and-zip': Error: Cannot find ffprobe
+    at C:\Users\D E L L\Desktop\VOICES\node_modules\fluent-ffmpeg\lib\ffprobe.js:145:31
+    at C:\Users\D E L L\Desktop\VOICES\node_modules\fluent-ffmpeg\lib\capabilities.js:194:9
+    at C:\Users\D E L L\Desktop\VOICES\node_modules\fluent-ffmpeg\lib\capabilities.js:183:15
+    at suppressedCallback (node:fs:258:5)
+    at FSReqCallback.oncomplete (node:fs:188:23)
