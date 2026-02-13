@@ -12,7 +12,7 @@ let mainWindow;
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1100,
-    height: 750,
+    height: 800,
     minWidth: 800,
     minHeight: 600,
     webPreferences: {
@@ -21,8 +21,9 @@ function createWindow() {
       nodeIntegration: false,
     },
     icon: path.join(__dirname, 'src', 'icons', 'icon.png'),
-    backgroundColor: '#0f0f0f',
+    backgroundColor: '#0a0a0f',
     show: false,
+    title: 'SnipWave',
   });
 
   mainWindow.loadFile(path.join(__dirname, 'src', 'index.html'));
@@ -57,11 +58,11 @@ ipcMain.handle('read-audio-file', async (event, filePath) => {
   return buffer;
 });
 
-// Split audio at cut points and create zip
-ipcMain.handle('split-and-zip', async (event, { filePath, cutPoints, outputPath }) => {
+// Split audio into segments (returns temp file paths and segment info)
+ipcMain.handle('split-audio', async (event, { filePath, cutPoints, duration }) => {
   const ext = path.extname(filePath);
   const baseName = path.basename(filePath, ext);
-  const tempDir = path.join(app.getPath('temp'), `voices_${Date.now()}`);
+  const tempDir = path.join(app.getPath('temp'), `snipwave_${Date.now()}`);
 
   if (!fs.existsSync(tempDir)) {
     fs.mkdirSync(tempDir, { recursive: true });
@@ -71,41 +72,44 @@ ipcMain.handle('split-and-zip', async (event, { filePath, cutPoints, outputPath 
   const sorted = [...cutPoints].sort((a, b) => a - b);
 
   // Build segments: [0, c1], [c1, c2], ..., [cN, end]
-  // We'll get duration first
-  const duration = await new Promise((resolve, reject) => {
-    ffmpeg.ffprobe(filePath, (err, metadata) => {
-      if (err) reject(err);
-      else resolve(metadata.format.duration);
-    });
-  });
-
   const boundaries = [0, ...sorted, duration];
   const segments = [];
   for (let i = 0; i < boundaries.length - 1; i++) {
     const start = boundaries[i];
     const end = boundaries[i + 1];
-    if (end - start < 0.01) continue; // skip near-zero segments
+    if (end - start < 0.01) continue;
     segments.push({ start, end, index: segments.length + 1 });
   }
 
-  // Split each segment
-  const splitPromises = segments.map((seg) => {
+  // Split each segment sequentially to avoid ffmpeg conflicts
+  const results = [];
+  for (const seg of segments) {
     const outputFile = path.join(tempDir, `${baseName}_part${String(seg.index).padStart(3, '0')}${ext}`);
-    return new Promise((resolve, reject) => {
+    await new Promise((resolve, reject) => {
       ffmpeg(filePath)
         .setStartTime(seg.start)
         .setDuration(seg.end - seg.start)
         .audioCodec('copy')
         .output(outputFile)
-        .on('end', () => resolve(outputFile))
+        .on('end', () => resolve())
         .on('error', (err) => reject(err))
         .run();
     });
-  });
+    results.push({
+      index: seg.index,
+      start: seg.start,
+      end: seg.end,
+      duration: seg.end - seg.start,
+      fileName: path.basename(outputFile),
+      filePath: outputFile,
+    });
+  }
 
-  const outputFiles = await Promise.all(splitPromises);
+  return { tempDir, segments: results };
+});
 
-  // Create zip
+// Create zip from selected segment files
+ipcMain.handle('zip-segments', async (event, { segmentPaths, outputPath }) => {
   await new Promise((resolve, reject) => {
     const output = fs.createWriteStream(outputPath);
     const archive = archiver('zip', { zlib: { level: 5 } });
@@ -114,19 +118,26 @@ ipcMain.handle('split-and-zip', async (event, { filePath, cutPoints, outputPath 
     archive.on('error', reject);
 
     archive.pipe(output);
-    for (const file of outputFiles) {
-      archive.file(file, { name: path.basename(file) });
+    for (const filePath of segmentPaths) {
+      if (fs.existsSync(filePath)) {
+        archive.file(filePath, { name: path.basename(filePath) });
+      }
     }
     archive.finalize();
   });
 
-  // Cleanup temp files
-  for (const file of outputFiles) {
-    try { fs.unlinkSync(file); } catch (e) { /* ignore */ }
-  }
-  try { fs.rmdirSync(tempDir); } catch (e) { /* ignore */ }
+  return { count: segmentPaths.length, outputPath };
+});
 
-  return { segmentCount: outputFiles.length, outputPath };
+// Cleanup temp directory
+ipcMain.handle('cleanup-temp', async (event, tempDir) => {
+  try {
+    const files = fs.readdirSync(tempDir);
+    for (const file of files) {
+      fs.unlinkSync(path.join(tempDir, file));
+    }
+    fs.rmdirSync(tempDir);
+  } catch (e) { /* ignore */ }
 });
 
 // Save dialog for zip
