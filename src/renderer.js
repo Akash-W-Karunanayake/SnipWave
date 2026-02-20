@@ -9,6 +9,13 @@ let currentFilePath = null;
 let cutPoints = [];
 let animFrameId = null;
 
+// Segment state
+let segments = []; // { index, start, end, duration, fileName, filePath, excluded }
+let tempDir = null;
+let selectedSegmentIndex = -1;
+let segmentSourceNode = null;
+let playingSegmentIndex = -1;
+
 // ===== DOM Elements =====
 const uploadScreen = document.getElementById('upload-screen');
 const editorScreen = document.getElementById('editor-screen');
@@ -31,6 +38,10 @@ const iconPlay = document.getElementById('icon-play');
 const iconPause = document.getElementById('icon-pause');
 const cutPointsSection = document.getElementById('cut-points-section');
 const cutPointsList = document.getElementById('cut-points-list');
+const segmentsSection = document.getElementById('segments-section');
+const segmentsList = document.getElementById('segments-list');
+const btnResetSplit = document.getElementById('btn-reset-split');
+const btnDownloadZip = document.getElementById('btn-download-zip');
 const processingOverlay = document.getElementById('processing-overlay');
 const processingText = document.getElementById('processing-text');
 
@@ -60,9 +71,11 @@ async function loadFile(filePath) {
   currentFilePath = filePath;
   cutPoints = [];
   pauseOffset = 0;
+  resetSegments();
 
   // Stop any playing audio
   stopAudio();
+  stopSegmentPlayback();
 
   // Read file buffer
   const buffer = await window.electronAPI.readAudioFile(filePath);
@@ -102,22 +115,19 @@ function drawWaveform() {
 
   ctx.clearRect(0, 0, width, height);
 
-  // Background gradient
-  const bgGrad = ctx.createLinearGradient(0, 0, 0, height);
-  bgGrad.addColorStop(0, '#1a1a1a');
-  bgGrad.addColorStop(1, '#141414');
-  ctx.fillStyle = bgGrad;
+  // Background
+  ctx.fillStyle = '#14141c';
   ctx.fillRect(0, 0, width, height);
 
   // Center line
-  ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+  ctx.strokeStyle = 'rgba(255,255,255,0.03)';
   ctx.lineWidth = 1;
   ctx.beginPath();
   ctx.moveTo(0, mid);
   ctx.lineTo(width, mid);
   ctx.stroke();
 
-  // Waveform bars
+  // Waveform
   const gradient = ctx.createLinearGradient(0, 0, 0, height);
   gradient.addColorStop(0, '#6c5ce7');
   gradient.addColorStop(0.5, '#a29bfe');
@@ -162,7 +172,6 @@ function playAudio() {
 
   sourceNode.onended = () => {
     if (isPlaying) {
-      // Reached the end
       isPlaying = false;
       pauseOffset = 0;
       updatePlayButton();
@@ -296,10 +305,9 @@ btnMarkCut.addEventListener('click', addCutPoint);
 
 function addCutPoint() {
   if (!audioBuffer) return;
-  const time = Math.round(getCurrentTime() * 1000) / 1000; // 3 decimal places
-  // Don't add duplicates or near-duplicates
+  if (segments.length > 0) return; // can't add cuts after split
+  const time = Math.round(getCurrentTime() * 1000) / 1000;
   if (cutPoints.some((t) => Math.abs(t - time) < 0.05)) return;
-  // Don't add at very start or end
   if (time < 0.05 || time > audioBuffer.duration - 0.05) return;
 
   cutPoints.push(time);
@@ -313,13 +321,9 @@ function removeCutPoint(index) {
 }
 
 function updateCutPointsUI() {
-  // Enable/disable split button
   btnSplit.disabled = cutPoints.length === 0;
-
-  // Show/hide section
   cutPointsSection.style.display = cutPoints.length > 0 ? 'block' : 'none';
 
-  // Render chips
   cutPointsList.innerHTML = '';
   cutPoints.forEach((time, i) => {
     const chip = document.createElement('div');
@@ -328,11 +332,11 @@ function updateCutPointsUI() {
       <span>${formatTime(time)}</span>
       <button class="remove-cut" title="Remove cut point">&times;</button>
     `;
-    chip.querySelector('.remove-cut').addEventListener('click', () => removeCutPoint(i));
-    chip.addEventListener('click', (e) => {
-      if (e.target.classList.contains('remove-cut')) return;
-      seekTo(time);
+    chip.querySelector('.remove-cut').addEventListener('click', (e) => {
+      e.stopPropagation();
+      removeCutPoint(i);
     });
+    chip.addEventListener('click', () => seekTo(time));
     cutPointsList.appendChild(chip);
   });
 
@@ -352,25 +356,204 @@ function renderCutMarkers() {
   });
 }
 
-// ===== Split & Zip =====
-btnSplit.addEventListener('click', async () => {
-  if (cutPoints.length === 0 || !currentFilePath) return;
+// ===== Split =====
+btnSplit.addEventListener('click', splitAudio);
+
+async function splitAudio() {
+  if (cutPoints.length === 0 || !currentFilePath || !audioBuffer) return;
+
+  processingOverlay.style.display = 'flex';
+  processingText.textContent = `Splitting into ${cutPoints.length + 1} segments...`;
+
+  try {
+    const result = await window.electronAPI.splitAudio({
+      filePath: currentFilePath,
+      cutPoints: cutPoints,
+      duration: audioBuffer.duration,
+    });
+
+    tempDir = result.tempDir;
+    segments = result.segments.map((s) => ({ ...s, excluded: false }));
+    selectedSegmentIndex = -1;
+
+    // Hide cut points, show segments
+    cutPointsSection.style.display = 'none';
+    btnMarkCut.disabled = true;
+    btnSplit.disabled = true;
+    segmentsSection.style.display = 'block';
+    renderSegments();
+
+    processingText.textContent = `Done! ${segments.length} segments created.`;
+    setTimeout(() => {
+      processingOverlay.style.display = 'none';
+    }, 1000);
+  } catch (err) {
+    processingText.textContent = `Error: ${err.message || err}`;
+    setTimeout(() => {
+      processingOverlay.style.display = 'none';
+    }, 3000);
+  }
+}
+
+// ===== Segments UI =====
+function renderSegments() {
+  segmentsList.innerHTML = '';
+
+  segments.forEach((seg, i) => {
+    const card = document.createElement('div');
+    card.className = 'segment-card';
+    if (i === selectedSegmentIndex) card.classList.add('selected');
+    if (seg.excluded) card.classList.add('excluded');
+
+    const isSegPlaying = playingSegmentIndex === i;
+
+    card.innerHTML = `
+      <div class="segment-number">${seg.index}</div>
+      <div class="segment-info">
+        <div class="segment-name">${seg.fileName}</div>
+        <div class="segment-meta">${formatTime(seg.start)} - ${formatTime(seg.end)} (${formatTime(seg.duration)})</div>
+      </div>
+      ${seg.excluded ? '<span class="excluded-badge">EXCLUDED</span>' : ''}
+      <div class="segment-controls">
+        ${seg.excluded ? `
+          <button class="segment-btn restore-btn" data-action="restore" title="Restore segment">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="1 4 1 10 7 10"/>
+              <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>
+            </svg>
+          </button>
+        ` : `
+          <button class="segment-btn play-btn ${isSegPlaying ? 'playing' : ''}" data-action="play" title="${isSegPlaying ? 'Stop' : 'Play'} segment">
+            ${isSegPlaying ? `
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                <rect x="4" y="4" width="16" height="16" rx="2"/>
+              </svg>
+            ` : `
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                <polygon points="5 3 19 12 5 21 5 3"/>
+              </svg>
+            `}
+          </button>
+          <button class="segment-btn delete-btn" data-action="delete" title="Exclude from zip">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="3 6 5 6 21 6"/>
+              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+            </svg>
+          </button>
+        `}
+      </div>
+    `;
+
+    // Click to select
+    card.addEventListener('click', (e) => {
+      if (e.target.closest('.segment-btn')) return;
+      selectedSegmentIndex = selectedSegmentIndex === i ? -1 : i;
+      renderSegments();
+    });
+
+    // Button actions
+    card.querySelectorAll('.segment-btn').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const action = btn.dataset.action;
+        if (action === 'play') toggleSegmentPlay(i);
+        else if (action === 'delete') excludeSegment(i);
+        else if (action === 'restore') restoreSegment(i);
+      });
+    });
+
+    segmentsList.appendChild(card);
+  });
+}
+
+function excludeSegment(index) {
+  stopSegmentPlayback();
+  segments[index].excluded = true;
+  if (selectedSegmentIndex === index) selectedSegmentIndex = -1;
+  renderSegments();
+}
+
+function restoreSegment(index) {
+  segments[index].excluded = false;
+  renderSegments();
+}
+
+// ===== Segment Playback =====
+function toggleSegmentPlay(index) {
+  if (playingSegmentIndex === index) {
+    stopSegmentPlayback();
+    renderSegments();
+    return;
+  }
+
+  stopSegmentPlayback();
+  stopAudio(); // stop main playback
+
+  const seg = segments[index];
+  if (!audioBuffer || !audioContext) return;
+
+  segmentSourceNode = audioContext.createBufferSource();
+  segmentSourceNode.buffer = audioBuffer;
+  segmentSourceNode.connect(audioContext.destination);
+  segmentSourceNode.start(0, seg.start, seg.duration);
+  playingSegmentIndex = index;
+
+  segmentSourceNode.onended = () => {
+    playingSegmentIndex = -1;
+    segmentSourceNode = null;
+    renderSegments();
+  };
+
+  renderSegments();
+}
+
+function stopSegmentPlayback() {
+  if (segmentSourceNode) {
+    segmentSourceNode.onended = null;
+    try { segmentSourceNode.stop(); } catch (e) { /* ignore */ }
+    segmentSourceNode = null;
+  }
+  playingSegmentIndex = -1;
+}
+
+// ===== Reset Split =====
+btnResetSplit.addEventListener('click', () => {
+  stopSegmentPlayback();
+  resetSegments();
+  btnMarkCut.disabled = false;
+  updateCutPointsUI();
+});
+
+function resetSegments() {
+  if (tempDir) {
+    window.electronAPI.cleanupTemp(tempDir);
+    tempDir = null;
+  }
+  segments = [];
+  selectedSegmentIndex = -1;
+  playingSegmentIndex = -1;
+  segmentsSection.style.display = 'none';
+}
+
+// ===== Download Zip =====
+btnDownloadZip.addEventListener('click', async () => {
+  const includedSegments = segments.filter((s) => !s.excluded);
+  if (includedSegments.length === 0) return;
 
   const baseName = currentFilePath.split(/[\\/]/).pop().replace(/\.[^.]+$/, '');
   const outputPath = await window.electronAPI.saveZipDialog(`${baseName}_split.zip`);
   if (!outputPath) return;
 
   processingOverlay.style.display = 'flex';
-  processingText.textContent = `Splitting into ${cutPoints.length + 1} segments...`;
+  processingText.textContent = `Zipping ${includedSegments.length} segments...`;
 
   try {
-    const result = await window.electronAPI.splitAndZip({
-      filePath: currentFilePath,
-      cutPoints: cutPoints,
+    const result = await window.electronAPI.zipSegments({
+      segmentPaths: includedSegments.map((s) => s.filePath),
       outputPath: outputPath,
     });
 
-    processingText.textContent = `Done! ${result.segmentCount} segments saved.`;
+    processingText.textContent = `Done! ${result.count} segments saved to zip.`;
     setTimeout(() => {
       processingOverlay.style.display = 'none';
     }, 1500);
