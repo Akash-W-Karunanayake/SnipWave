@@ -19,6 +19,9 @@ A sleek desktop application to split long audio files into multiple segments at 
 - **Dark Theme** — Modern, sleek dark UI with gradient branding
 - **Double-Click Launch** — Open the app directly without a terminal via `Launch SnipWave.vbs`
 
+![Landing Page](assets/intro.png)
+![Dashboard](assets/Inside.png)
+
 ## Getting Started
 
 ### Prerequisites
